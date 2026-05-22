@@ -1,0 +1,18 @@
+# ============================================================
+# LNMP Docker - 共享网络
+#
+# Author:  PiaoYun <piaoyunsoft@163.com>
+# Website: https://www.chinapyg.com
+# License: MIT
+#
+# 此文件只声明共享网络 pp_lnmp_net, 其它 stack 用 external: true 接入
+# 实际由 `lnmp init` 通过 docker network create 创建, 一般不用直接调用
+# ============================================================
+networks:
+  pp_lnmp_net:
+    name: ${LNMP_NETWORK:-pp_lnmp_net}
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${LNMP_SUBNET:-172.28.0.0/16}
+

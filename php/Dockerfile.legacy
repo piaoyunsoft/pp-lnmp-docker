@@ -1,0 +1,97 @@
+# PHP 5.6 / 7.0 / 7.1 兼容镜像 (debian, OpenSSL 1.0 时代)
+# 用于跑老 Discuz / ECShop / 老 WP / 老 ThinkPHP 等 EOL 项目
+ARG PHP_VERSION=5.6
+FROM php:${PHP_VERSION}-fpm
+
+LABEL org.opencontainers.image.title="lnmp-docker-php-legacy"
+LABEL org.opencontainers.image.description="LNMP Docker PHP (debian) - PHP 5.6 / 7.0 / 7.1 (legacy)"
+LABEL org.opencontainers.image.authors="PiaoYun <piaoyunsoft@163.com>"
+LABEL org.opencontainers.image.url="https://www.chinapyg.com"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL maintainer="PiaoYun <piaoyunsoft@163.com>"
+ARG TZ=Asia/Shanghai
+ENV TZ=${TZ}
+
+# 老 debian 软件源可能已归档, 切到 archive (有国内加速源就用国内的)
+# 国内可选: mirrors.aliyun.com/debian-archive  /  mirrors.tuna.tsinghua.edu.cn/debian-archive
+ARG DEB_ARCHIVE=mirrors.aliyun.com/debian-archive/debian
+ARG DEB_ARCHIVE_SEC=mirrors.aliyun.com/debian-archive/debian-security
+RUN set -eux; \
+    if grep -q stretch /etc/apt/sources.list 2>/dev/null; then \
+        { echo "deb http://${DEB_ARCHIVE} stretch main"; \
+          echo "deb http://${DEB_ARCHIVE_SEC} stretch/updates main"; } > /etc/apt/sources.list; \
+        echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until; \
+    fi; \
+    if grep -q jessie /etc/apt/sources.list 2>/dev/null; then \
+        echo "deb http://${DEB_ARCHIVE} jessie main" > /etc/apt/sources.list; \
+        echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until; \
+    fi
+
+# 系统 + 构建依赖 (合并在一起, 老 debian)
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
+        ca-certificates curl git unzip bash tzdata \
+        libfreetype6-dev libjpeg62-turbo-dev libpng-dev libwebp-dev \
+        libicu-dev libzip-dev libxml2-dev libonig-dev libgmp-dev \
+        zlib1g-dev libssl-dev libcurl4-openssl-dev libsasl2-dev \
+        imagemagick libmagickwand-dev; \
+    ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime; echo "${TZ}" > /etc/timezone; \
+    rm -rf /var/lib/apt/lists/*
+
+# 扩展编译 (5.6 用 mysql, 7+ 该用 mysqli/pdo_mysql; PHP 7.4+ 没 mysql 扩展)
+# gd 在 5.6/7.0/7.1 用老语法, 7.2+ 用新语法
+# gmp 在老 PHP 找不到 multi-arch 头文件, 显式指定路径
+RUN set -eux; \
+    PHP_MAJOR=$(php -r 'echo PHP_MAJOR_VERSION;'); \
+    PHP_MINOR=$(php -r 'echo PHP_MINOR_VERSION;'); \
+    ARCH=$(dpkg-architecture --query DEB_HOST_MULTIARCH); \
+    ln -sf /usr/include/${ARCH}/gmp.h /usr/include/gmp.h; \
+    if [ "$PHP_MAJOR" = "5" ]; then \
+        docker-php-ext-configure gd --with-freetype-dir=/usr/include/ --with-jpeg-dir=/usr/include/ --with-png-dir=/usr/include/; \
+        docker-php-ext-configure gmp --with-gmp=/usr; \
+        EXT="bcmath gd intl mbstring mysql mysqli pdo_mysql opcache pcntl sockets zip exif gmp soap xml"; \
+    elif [ "$PHP_MAJOR" = "7" ] && [ "$PHP_MINOR" -le "1" ]; then \
+        docker-php-ext-configure gd --with-freetype-dir=/usr/include/ --with-jpeg-dir=/usr/include/ --with-png-dir=/usr/include/; \
+        docker-php-ext-configure gmp --with-gmp=/usr; \
+        EXT="bcmath gd intl mbstring mysqli pdo_mysql opcache pcntl sockets zip exif gmp soap xml"; \
+    else \
+        docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp; \
+        EXT="bcmath gd intl mbstring mysqli pdo_mysql opcache pcntl sockets zip exif gmp soap xml"; \
+    fi; \
+    docker-php-ext-install -j$(nproc) $EXT
+
+# redis + imagick pecl
+RUN set -eux; \
+    PHP_MAJOR=$(php -r 'echo PHP_MAJOR_VERSION;'); \
+    if [ "$PHP_MAJOR" = "5" ]; then \
+        pecl install redis-4.3.0 imagick-3.4.4; \
+    else \
+        pecl install redis imagick; \
+    fi; \
+    docker-php-ext-enable redis imagick
+
+# Composer (老 PHP 用 composer 2.2 LTS, 仍然支持 5.6+)
+RUN curl -fsSL https://getcomposer.org/installer | php -- --install-dir=/usr/bin --filename=composer --2.2 \
+    || curl -fsSL https://getcomposer.org/installer | php -- --install-dir=/usr/bin --filename=composer
+
+# 清理
+RUN apt-get purge -y --auto-remove \
+        libfreetype6-dev libjpeg62-turbo-dev libpng-dev libwebp-dev \
+        libicu-dev libzip-dev libxml2-dev libonig-dev libgmp-dev \
+        zlib1g-dev libssl-dev libcurl4-openssl-dev libsasl2-dev 2>/dev/null || true; \
+    apt-get clean; rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# www-data uid 33 在 debian; 与 alpine(82) 不同, 站点 volume 权限可能要 chown
+# 配置由 sites/<域>/docker-compose.yml 挂载 (按版本选 php/conf/56/ 等)
+
+# 装 fcgi (libfcgi-bin) 用于 healthcheck
+RUN apt-get update && apt-get install -y --no-install-recommends libfcgi-bin && rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+
+WORKDIR /var/www/html
+EXPOSE 9000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
+    CMD SCRIPT_NAME=/fpm-ping SCRIPT_FILENAME=/fpm-ping REQUEST_METHOD=GET cgi-fcgi -bind -connect 127.0.0.1:9000 || exit 1
+
+CMD ["php-fpm", "-F"]
