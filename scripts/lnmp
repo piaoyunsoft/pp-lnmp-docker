@@ -540,8 +540,20 @@ cmd_site_add() {
     local conf="nginx-gateway/conf/sites/${domain}.conf"
     local rewrite_line=""
     [[ -n "$rewrite" ]] && rewrite_line="include /etc/nginx/rewrite/${rewrite}.conf;"
-    sed -e "s/DOMAIN/${domain}/g" -e "s/SITE_KEY/${key}/g" \
+
+    # 证书路径 fallback: 如果该站证书不存在, 用 default 占位证书 (避免 nginx 全站暴毙)
+    local cert_crt="/etc/nginx/ssl/live/${domain}/fullchain.cer"
+    local cert_key="/etc/nginx/ssl/live/${domain}/${domain}.key"
+    if [[ ! -f "ssl/live/${domain}/fullchain.cer" ]]; then
+        warn "$domain 无有效证书, 暂用 default 占位 (稍后签发: lnmp cert:issue $domain)"
+        cert_crt="/etc/nginx/ssl/default/fullchain.cer"
+        cert_key="/etc/nginx/ssl/default/default.key"
+    fi
+
+    sed -e "s|DOMAIN|${domain}|g" -e "s|SITE_KEY|${key}|g" \
         -e "s|REWRITE_INCLUDE|${rewrite_line}|" \
+        -e "s|ssl_certificate .*|ssl_certificate ${cert_crt};|" \
+        -e "s|ssl_certificate_key .*|ssl_certificate_key ${cert_key};|" \
         nginx-gateway/conf/sites/_template.conf.example > "$conf"
     [[ -n "$rewrite" ]] && say "已套用 rewrite: $rewrite"
 
@@ -689,21 +701,28 @@ cmd_cert_issue() {
     [[ -z "$domain" ]] && { err "用法: lnmp cert:issue <domain>"; exit 1; }
     docker ps --format '{{.Names}}' | grep -q pp_lnmp_acme || { err "请先 lnmp up nginx"; exit 1; }
 
+    # 智能 SAN: 根域同时签 www; 已是 www 或子域不再加
+    local extra_d=""
+    if [[ "$domain" =~ ^[^.]+\.[^.]+$ ]]; then
+        extra_d="-d www.$domain"
+    fi
+
     _acme --register-account -m "${ACME_EMAIL}" --server letsencrypt || true
 
     if [[ -n "${ACME_DNS_API:-}" ]]; then
-        say "DNS 模式 ($ACME_DNS_API) 签发 $domain"
-        _acme --issue --dns "$ACME_DNS_API" -d "$domain" -d "www.$domain" --server letsencrypt
+        say "DNS 模式 ($ACME_DNS_API) 签发 $domain ${extra_d:+(+ www)}"
+        _acme --issue --dns "$ACME_DNS_API" -d "$domain" $extra_d --server letsencrypt
     else
-        say "webroot(http-01) 模式签发 $domain"
+        say "webroot(http-01) 模式签发 $domain ${extra_d:+(+ www)}"
         mkdir -p acme/data/.well-known/acme-challenge
-        _acme --issue -d "$domain" -d "www.$domain" \
+        _acme --issue -d "$domain" $extra_d \
             -w /acme.sh/.well-known --server letsencrypt
     fi
 
-    _acme --install-cert -d "$domain" \
-        --key-file       /ssl/live/$domain/$domain.key \
-        --fullchain-file /ssl/live/$domain/fullchain.cer \
+    docker exec pp_lnmp_acme mkdir -p "/ssl/live/$domain" 2>/dev/null || true
+    _acme --install-cert -d "$domain" --ecc \
+        --key-file       "/ssl/live/$domain/$domain.key" \
+        --fullchain-file "/ssl/live/$domain/fullchain.cer" \
         --reloadcmd      "echo reload-handled-by-host"
 
     cmd_site_reload || true
