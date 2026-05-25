@@ -28,6 +28,8 @@ lnmp_docker/
 │   ├── conf/
 │   │   ├── nginx.conf        # 主配 (gzip/限流/open_file_cache/SSL)
 │   │   ├── snippets/         # ssl.conf / php-fpm.conf 复用
+│   │   ├── rewrite/          # 19 个常见程序伪静态规则 (来自军哥 LNMP)
+│   │   └── sites/            # vhost (lnmp site:add 自动生成)
 │   │   └── sites/            # vhost (lnmp site:add 自动生成)
 │   └── logs/
 │
