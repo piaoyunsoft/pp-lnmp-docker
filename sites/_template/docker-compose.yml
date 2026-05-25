@@ -1,0 +1,57 @@
+# ============================================================
+# LNMP Docker - 站点模板
+#
+# Author:  PiaoYun <piaoyunsoft@163.com>
+# Website: https://www.chinapyg.com
+# License: MIT
+#
+# SITE_KEY / SITE_DOMAIN / PHP_VERSION / PHP_DOCKERFILE / PHP_CONF_DIR
+# 由 scripts/lnmp site:add 注入 (写入 sites/<key>/.env)
+#
+# 顶层 name 让每站独立 project, 避免互相 recreate
+# ============================================================
+name: pp_lnmp_site_${SITE_KEY}
+
+services:
+  php:
+    build:
+      context: ../../php
+      dockerfile: ${PHP_DOCKERFILE:-Dockerfile.alpine}
+      args:
+        PHP_VERSION: ${PHP_VERSION}
+    image: lnmp/php:${PHP_VERSION}
+    container_name: pp_lnmp_site_${SITE_KEY}_php
+    restart: unless-stopped
+    # 站点 .env 隔离, 不继承根 .env (避免 ROOT 密码暴露给 PHP)
+    env_file: ./.env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      SITE_KEY: ${SITE_KEY}
+      SITE_DOMAIN: ${SITE_DOMAIN}
+    volumes:
+      - ./www:/var/www/${SITE_KEY}/www
+      - ./logs:/var/log/php
+      - ../../php/conf/${PHP_CONF_DIR}/php.ini:/usr/local/etc/php/php.ini:ro
+      - ../../php/conf/${PHP_CONF_DIR}/www.conf:/usr/local/etc/php-fpm.d/www.conf:ro
+      - ../../php/conf/${PHP_CONF_DIR}/opcache.ini:/usr/local/etc/php/conf.d/10-opcache.ini:ro
+    working_dir: /var/www/${SITE_KEY}/www
+    tmpfs:
+      - /tmp:size=256M,mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      pp_lnmp_net:
+        aliases:
+          - ${SITE_KEY}_php
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+networks:
+  pp_lnmp_net:
+    external: true
+    name: ${LNMP_NETWORK:-pp_lnmp_net}

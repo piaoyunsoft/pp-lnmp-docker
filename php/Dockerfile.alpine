@@ -1,0 +1,84 @@
+ARG PHP_VERSION=8.3
+FROM php:${PHP_VERSION}-fpm-alpine
+
+LABEL org.opencontainers.image.title="lnmp-docker-php-alpine"
+LABEL org.opencontainers.image.description="LNMP Docker PHP (alpine) - PHP 7.2 ~ 8.4"
+LABEL org.opencontainers.image.authors="PiaoYun <piaoyunsoft@163.com>"
+LABEL org.opencontainers.image.url="https://www.chinapyg.com"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL maintainer="PiaoYun <piaoyunsoft@163.com>"
+
+ARG TZ=Asia/Shanghai
+ENV TZ=${TZ}
+
+# 国内 apk 源加速 (留空走默认; 国内推荐 mirrors.aliyun.com 或 mirrors.tuna.tsinghua.edu.cn)
+ARG APK_MIRROR=mirrors.aliyun.com
+RUN if [ -n "$APK_MIRROR" ]; then \
+        sed -i "s/dl-cdn.alpinelinux.org/$APK_MIRROR/g" /etc/apk/repositories; \
+    fi
+
+# 系统依赖
+RUN set -eux; \
+    apk add --no-cache \
+        tzdata bash git curl unzip \
+        icu-libs libpng libjpeg-turbo libwebp libzip oniguruma libxml2 \
+        freetype gmp libgmpxx \
+    && cp /usr/share/zoneinfo/${TZ} /etc/localtime \
+    && echo "${TZ}" > /etc/timezone
+
+# 构建依赖 (装完即删)
+# 注: imagick 在 PHP 8.4+ 长期没维护, build 经常崩, 默认不装
+#     需要 imagick: build 时加 --build-arg INSTALL_IMAGICK=1, 且限 PHP <= 8.3
+ARG INSTALL_IMAGICK=0
+RUN set -eux; \
+    apk add --no-cache --virtual .build-deps \
+        $PHPIZE_DEPS \
+        icu-dev libpng-dev libjpeg-turbo-dev libwebp-dev libzip-dev \
+        oniguruma-dev libxml2-dev freetype-dev \
+        linux-headers gmp-dev \
+        $([ "$INSTALL_IMAGICK" = "1" ] && echo "imagemagick-dev") \
+    && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \
+    && docker-php-ext-install -j$(nproc) \
+        bcmath gd intl mbstring opcache pdo_mysql mysqli \
+        pcntl sockets zip exif gmp soap xml \
+    && pecl install redis \
+    && docker-php-ext-enable redis \
+    && if [ "$INSTALL_IMAGICK" = "1" ]; then \
+           (pecl install imagick && docker-php-ext-enable imagick) || echo "WARN: imagick build failed"; \
+       fi \
+    && apk del .build-deps \
+    && rm -rf /tmp/* /var/cache/apk/*
+
+# Composer
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+# 配置由 sites/<域>/docker-compose.yml 挂载 (按版本选 php/conf/8x|7x|56/)
+# 这里不 COPY conf, 避免镜像写死
+
+# 安装 fcgi 包用于 healthcheck
+RUN apk add --no-cache fcgi
+
+# Entrypoint 脚本: 根据 PHP_VERSION 处理 opcache.ini (8.3+ 移除 zend_extension)
+RUN cat > /usr/local/bin/php-fpm-entrypoint.sh <<'EOF'
+#!/bin/sh
+set -e
+INI_FILE="/usr/local/etc/php/conf.d/10-opcache.ini"
+# PHP 8.3+ 已内置 opcache, zend_extension=opcache 会重复加载导致警告
+if [ -f "$INI_FILE" ] && grep -q '^zend_extension.*opcache' "$INI_FILE"; then
+    grep -v '^zend_extension.*opcache' "$INI_FILE" > /tmp/10-opcache.ini
+    cat /tmp/10-opcache.ini > "$INI_FILE"
+    rm -f /tmp/10-opcache.ini
+fi
+exec php-fpm -F
+EOF
+RUN chmod +x /usr/local/bin/php-fpm-entrypoint.sh
+
+WORKDIR /var/www/html
+
+# fpm 用 www-data (php 镜像自带 uid 82)
+EXPOSE 9000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
+    CMD SCRIPT_NAME=/fpm-ping SCRIPT_FILENAME=/fpm-ping REQUEST_METHOD=GET cgi-fcgi -bind -connect 127.0.0.1:9000 || exit 1
+
+ENTRYPOINT ["/usr/local/bin/php-fpm-entrypoint.sh"]

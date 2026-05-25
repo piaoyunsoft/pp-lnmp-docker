@@ -1,0 +1,1030 @@
+#!/usr/bin/env bash
+# ============================================================
+# lnmp - LNMP Docker 统一管理 CLI
+#
+# Author:  PiaoYun <piaoyunsoft@163.com>
+# Website: https://www.chinapyg.com
+# License: MIT
+#
+# 用法: ./scripts/lnmp <command> [args...]
+# ============================================================
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+# ---------- 颜色 ----------
+if [[ -t 1 ]]; then
+    C_R='\033[0;31m'; C_G='\033[0;32m'; C_Y='\033[0;33m'; C_B='\033[0;34m'; C_N='\033[0m'
+else
+    C_R=''; C_G=''; C_Y=''; C_B=''; C_N=''
+fi
+say()  { echo -e "${C_B}[lnmp]${C_N} $*"; }
+ok()   { echo -e "${C_G}[ ok ]${C_N} $*"; }
+warn() { echo -e "${C_Y}[warn]${C_N} $*"; }
+err()  { echo -e "${C_R}[err ]${C_N} $*" >&2; }
+
+# ---------- 前置 ----------
+if [[ ! -f .env ]]; then
+    if [[ -f .env.example ]]; then
+        warn ".env 不存在，自动从 .env.example 复制。请编辑后再次运行！"
+        cp .env.example .env
+    else
+        err ".env / .env.example 都不存在"; exit 1
+    fi
+fi
+
+# 兼容 docker compose / docker-compose
+if docker compose version >/dev/null 2>&1; then
+    DC="docker compose"
+else
+    DC="docker-compose"
+fi
+
+# 加载 .env (导出供子 compose) — 逐行解析,允许值含 #,跳过注释行
+_load_env() {
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            export "${BASH_REMATCH[1]}=${BASH_REMATCH[2]}"
+        fi
+    done < "$ROOT_DIR/.env"
+}
+_load_env
+
+COMPOSE_NET="--env-file $ROOT_DIR/.env -f $ROOT_DIR/docker-compose.yml"
+
+stack_compose() {  # stack_compose <stack>
+    echo "--env-file $ROOT_DIR/.env -f $ROOT_DIR/$1/docker-compose.yml"
+}
+
+ensure_network() {
+    if ! docker network inspect "${LNMP_NETWORK}" >/dev/null 2>&1; then
+        say "创建共享网络 ${LNMP_NETWORK} (${LNMP_SUBNET})"
+        docker network create \
+            --driver bridge \
+            --subnet "${LNMP_SUBNET}" \
+            "${LNMP_NETWORK}" >/dev/null
+        ok "网络已创建"
+    fi
+}
+
+# ============================================================
+# 子命令
+# ============================================================
+
+cmd_help() {
+    cat <<EOF
+用法: lnmp <command> [args]
+
+核心:
+  init                    初始化目录/网络 (首次运行)
+  up      [stack...]      启动栈 (默认: 基础栈 + 用过的可选栈 + 所有站点)
+                          可选 stack: redis | adminer | mysql57 (老站)
+  down    [stack...] [--all]
+                          默认: 只停所有站点 (公共服务保留, 不影响其它站)
+                          --all: 公共服务 + 所有站全停
+                          显式: lnmp down mysql redis  只停指定
+  restart [stack...] [--all]
+                          默认: 只重启所有站点
+                          --all: 公共 + 站点全重启
+                          显式: lnmp restart nginx  只重启指定
+  ps                      查看所有容器
+  logs    <stack> [-f]    查看日志
+
+站点:
+  site:add    <domain> [php_ver] [--env-db] [--rewrite=<name>]
+                                   新增站点 (php_ver 默认 ${PHP_DEFAULT_VERSION})
+                                   支持: 5.6 | 7.0-7.4 | 8.0-8.4
+                                   5.6/7.0/7.1 用 debian 镜像(老 OpenSSL)
+                                   交互式选 MySQL 8.4 / 5.7 并建库
+                                   --env-db: DB 凭据写 sites/<key>/.env
+                                             (给 Laravel/Symfony 等用 getenv() 的框架)
+                                             默认不写; Discuz/WP 等装时手动填
+                                   --rewrite: 套用常见程序 rewrite 规则
+                                              查可用: lnmp site:rewrites
+  site:rm     <domain> [--purge]   删除站点 (默认保留 www; --purge 彻底清)
+  site:list                        列出站点
+  site:up     <domain>             启动单站
+  site:down   <domain>             停止单站 (数据保留)
+  site:reload                      reload nginx (改了 vhost/snippets)
+  site:restart <domain> [--build]  重启某站 PHP (改 ini 用; --build 重建镜像)
+  site:logs   <domain> [-f]        看某站 PHP 日志
+  site:rewrites                    列出可用 rewrite 规则
+
+证书:
+  cert:issue  <domain>             签发证书 (用 ACME_DNS_API 或 webroot)
+  cert:renew  [domain]             续期 (留空=全部)
+  cert:list                        列出已签发证书
+
+数据库 (默认操作 MySQL 8.4, 加 -m 57 切到 MySQL 5.7):
+  db:cli     [-m 57|8]                       进入 mysql client
+  db:dump    [-m 57|8] <database>            导出指定库到 backups/
+  db:dumpall [-m 57|8]                       导出全部库
+  db:import  [-m 57|8] <file>                导入 SQL (支持 .gz)
+  db:create  [-m 57|8] <name> [user] [pass]  建库 + 授权
+  db:passwd  [-m 57|8] <user> <newpass>      改密码 (root 自动写回 .env)
+  db:users   [-m 57|8]                       列出 mysql 用户
+
+Redis:
+  redis:cli                        进入 redis-cli
+  redis:passwd <newpass>           改密码 (运行时生效 + 同步 .env)
+
+PHP:
+  php:cli   <domain> [cmd...]      在站点 php 容器执行命令
+  php:composer <domain> [args...]  composer 快捷方式
+
+工具:
+  shell   <container>              进入容器 sh
+  exec    <container> <cmd...>     在容器执行命令
+  pull                             拉取所有镜像
+  prune                            清理无用镜像/网络
+
+------------------------------------------------------------
+LNMP Docker by PiaoYun <piaoyunsoft@163.com>
+https://www.chinapyg.com
+EOF
+}
+
+cmd_init() {
+    ensure_network
+    mkdir -p mysql/data mysql/logs mysql/init \
+             redis/data \
+             nginx-gateway/logs \
+             acme/data acme/data/.well-known/acme-challenge \
+             ssl/live ssl/default ssl/dhparam \
+             backups
+    # 默认 SSL 占位证书 (nginx default_server 用)
+    if [[ ! -f ssl/default/fullchain.cer ]]; then
+        say "生成默认 SSL 占位证书 (用于拒绝未知 SNI)"
+        if command -v openssl >/dev/null 2>&1; then
+            openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+                -keyout ssl/default/default.key \
+                -out    ssl/default/fullchain.cer \
+                -subj "/CN=lnmp-default" 2>/dev/null && ok "默认证书已生成"
+        else
+            warn "宿主无 openssl, 默认证书将在首次启动 acme 后生成"
+        fi
+    fi
+    ok "目录与网络就绪"
+}
+
+# ----- up / down / restart -----
+# 默认要起的栈; 按"实际有站点依赖"决定起哪些可选栈
+_default_stacks() {
+    local stacks="nginx-gateway mysql"
+    local need_mysql57=0 need_redis=0
+
+    # 扫所有站点 .env, 看是否用到 mysql57 / redis
+    for d in sites/*/; do
+        local envf="$d/.env"
+        [[ -f "$envf" ]] || continue
+        [[ "$(basename "$d")" == "_template" ]] && continue
+        # 业务依赖: LNMP_USE_MYSQL=mysql57 (lnmp 标记) 或 DB_HOST=mysql57 (--env-db 写的)
+        grep -qE '^(LNMP_USE_MYSQL|DB_HOST)=(mysql57|mysql5|mysql-old)' "$envf" 2>/dev/null && need_mysql57=1
+        # 站点 .env 标 LNMP_USE_REDIS=1 / REDIS=1 -> 需 redis
+        grep -qE '^(LNMP_USE_REDIS|REDIS)=1' "$envf" 2>/dev/null && need_redis=1
+    done
+
+    # 没站点依赖但容器之前在跑 -> 也起 (用户手动启过, 视为常驻)
+    [[ $need_mysql57 -eq 0 ]] && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^pp_lnmp_mysql57$' && need_mysql57=1
+    [[ $need_redis -eq 0 ]] && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^pp_lnmp_redis$' && need_redis=1
+
+    [[ $need_mysql57 -eq 1 ]] && stacks+=" mysql57"
+    [[ $need_redis -eq 1 ]] && stacks+=" redis"
+    # adminer 不自动起 (是临时管理工具, 不算业务依赖)
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^pp_lnmp_adminer$' && stacks+=" adminer"
+    echo "$stacks"
+}
+
+_resolve_stack() {  # 别名 -> 目录
+    case "$1" in
+        nginx|gateway|web)    echo "nginx-gateway" ;;
+        db|mysql|mysql8|mysql84) echo "mysql" ;;
+        mysql5|mysql57|db5|db57) echo "mysql57" ;;
+        cache|redis)          echo "redis" ;;
+        adminer)              echo "adminer" ;;
+        *)                    echo "$1" ;;
+    esac
+}
+
+cmd_up() {
+    ensure_network
+    # 关键挂载点必须先存在
+    mkdir -p acme/data/.well-known/acme-challenge ssl/live ssl/default nginx-gateway/logs \
+             mysql/data mysql/logs mysql/init redis/data backups
+    local stacks=("$@")
+    local explicit=1
+    if [[ ${#stacks[@]} -eq 0 ]]; then
+        stacks=($(_default_stacks))
+        explicit=0
+    fi
+    for s in "${stacks[@]}"; do
+        s=$(_resolve_stack "$s")
+        [[ -f "$s/docker-compose.yml" ]] || { err "未知栈: $s"; continue; }
+        say "启动 $s"
+        $DC $(stack_compose "$s") up -d
+    done
+    # 起完 nginx-gateway 后, 若缺默认证书就借 acme 容器签一张
+    if [[ ! -f ssl/default/fullchain.cer ]] && docker ps --format '{{.Names}}' | grep -q '^pp_lnmp_acme$'; then
+        say "生成默认 SSL 证书 (用于拒绝未知 SNI)"
+        docker exec pp_lnmp_acme sh -c "mkdir -p /ssl/default && openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+            -keyout /ssl/default/default.key -out /ssl/default/fullchain.cer -subj '/CN=lnmp-default' 2>/dev/null" \
+        && docker exec pp_lnmp_nginx nginx -s reload 2>/dev/null || true
+    fi
+    # 不显式指定栈时, 顺便起所有站点 (避免 nginx 找不到 upstream)
+    [[ $explicit -eq 0 ]] && _start_all_sites
+    ok "完成"
+}
+
+cmd_down() {
+    # 解析 --all 开关
+    local all=0
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all|-a) all=1; shift ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    set -- "${args[@]}"
+
+    local stacks=("$@")
+    local explicit=1
+    if [[ ${#stacks[@]} -eq 0 ]]; then
+        if [[ $all -eq 1 ]]; then
+            # 全停: 公共服务 + 所有站
+            stacks=(nginx-gateway adminer redis mysql57 mysql)
+            explicit=0
+            _down_all_sites=1
+        else
+            # 默认: 只停站点, 保留公共服务 (避免误关 MySQL 影响所有站)
+            say "只停所有站点 (公共服务 nginx/mysql/redis 保留, 全停用 --all)"
+            _down_all_sites_only
+            return
+        fi
+    fi
+
+    # 栈名 -> 主容器名映射
+    local ct
+    for s in "${stacks[@]}"; do
+        s=$(_resolve_stack "$s")
+        [[ -f "$s/docker-compose.yml" ]] || { [[ $explicit -eq 1 ]] && err "未知栈: $s"; continue; }
+        case "$s" in
+            nginx-gateway) ct="pp_lnmp_nginx" ;;
+            mysql)         ct="pp_lnmp_mysql" ;;
+            mysql57)       ct="pp_lnmp_mysql57" ;;
+            redis)         ct="pp_lnmp_redis" ;;
+            adminer)       ct="pp_lnmp_adminer" ;;
+            *)             ct="" ;;
+        esac
+        # 非显式调用且容器没存在,跳过
+        if [[ $explicit -eq 0 && -n "$ct" ]] && ! docker ps -aq --filter "name=^${ct}$" | grep -q .; then
+            continue
+        fi
+        say "停止 $s"
+        $DC $(stack_compose "$s") down 2>/dev/null || true
+    done
+
+    # --all 顺便停所有站点
+    [[ ${_down_all_sites:-0} -eq 1 ]] && _down_all_sites_only
+}
+
+# 只停所有站点的 PHP 容器, 不动公共服务
+_down_all_sites_only() {
+    for d in sites/*/; do
+        [[ -f "$d/docker-compose.yml" ]] || continue
+        local name; name=$(basename "$d")
+        [[ "$name" == "_template" ]] && continue
+        local ct_name="pp_lnmp_site_${name}_php"
+        docker ps -aq --filter "name=^${ct_name}$" | grep -q . || continue
+        say "停止 site $name"
+        local proj="pp_lnmp_site_${name}"
+        # 先用新 project 名 down
+        (cd "$d" && $DC -p "$proj" --env-file "$ROOT_DIR/.env" --env-file ./.env down) >/dev/null 2>&1 || true
+        # 容器还在 (旧 project 名启动的) -> 强删
+        if docker ps -aq --filter "name=^${ct_name}$" | grep -q .; then
+            docker rm -f "$ct_name" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+# restart: 默认只重启所有站点; --all 重启公共 + 站点
+cmd_restart() {
+    local all=0
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all|-a) all=1; shift ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    set -- "${args[@]}"
+
+    if [[ $# -gt 0 ]]; then
+        # 显式给栈名: 重启它们
+        cmd_down "$@"
+        cmd_up "$@"
+        return
+    fi
+
+    if [[ $all -eq 1 ]]; then
+        cmd_down --all
+        cmd_up
+    else
+        say "只重启所有站点 (公共服务保留, 全重启用 --all)"
+        _down_all_sites_only
+        _start_all_sites
+    fi
+}
+
+# 单站操作
+cmd_site_up() {
+    local domain="${1:-}"
+    [[ -z "$domain" ]] && { err "用法: lnmp site:up <domain>"; exit 1; }
+    local key; key=$(echo "$domain" | tr '.-' '__')
+    local sdir="sites/$key"
+    [[ -d "$sdir" ]] || { err "站点不存在: $sdir"; exit 1; }
+    say "启动 site $domain"
+    (cd "$sdir" && $DC -p "pp_lnmp_site_$key" --env-file "$ROOT_DIR/.env" --env-file ./.env up -d)
+    docker exec pp_lnmp_nginx nginx -s reload 2>/dev/null || true
+    ok "$domain 已启动"
+}
+
+cmd_site_down() {
+    local domain="${1:-}"
+    [[ -z "$domain" ]] && { err "用法: lnmp site:down <domain>"; exit 1; }
+    local key; key=$(echo "$domain" | tr '.-' '__')
+    local sdir="sites/$key"
+    [[ -d "$sdir" ]] || { err "站点不存在: $sdir"; exit 1; }
+    local ct_name="pp_lnmp_site_${key}_php"
+    say "停止 site $domain"
+    (cd "$sdir" && $DC -p "pp_lnmp_site_$key" --env-file "$ROOT_DIR/.env" --env-file ./.env down) >/dev/null 2>&1 || true
+    # 容器还在 (旧 project 名启动的) -> 强删
+    if docker ps -aq --filter "name=^${ct_name}$" | grep -q .; then
+        docker rm -f "$ct_name" >/dev/null 2>&1 || true
+    fi
+    ok "$domain 已停止"
+}
+
+# 启动所有 sites/<域>/ 下的 PHP 容器
+_start_all_sites() {
+    local started=0
+    for d in sites/*/; do
+        [[ -f "$d/docker-compose.yml" ]] || continue
+        local name; name=$(basename "$d")
+        [[ "$name" == "_template" ]] && continue
+        say "启动 site $name"
+        local proj="pp_lnmp_site_${name}"
+        # 显式 -p 避免被根 .env 的 COMPOSE_PROJECT_NAME 覆盖
+        (cd "$d" && $DC -p "$proj" --env-file "$ROOT_DIR/.env" --env-file ./.env up -d 2>&1 | grep -v "level=warning\|orphan") || true
+        started=$((started+1))
+    done
+    if [[ $started -gt 0 ]]; then
+        # 站点起来后, reload nginx 让 upstream 重新解析
+        docker exec pp_lnmp_nginx nginx -s reload 2>/dev/null || docker restart pp_lnmp_nginx >/dev/null 2>&1 || true
+        ok "已启动 $started 个站点 + reload nginx"
+    fi
+}
+
+cmd_ps()   { docker ps -a --filter "name=lnmp_" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"; }
+cmd_logs() {
+    local stack="$1"; shift || true
+    stack=$(_resolve_stack "$stack")
+    $DC $(stack_compose "$stack") logs "$@"
+}
+
+# ----- 站点 -----
+cmd_site_add() {
+    local domain="" phpv="$PHP_DEFAULT_VERSION" env_db=0 rewrite=""
+    # 解析: 位置参数 domain phpv + 开关
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --env-db) env_db=1; shift ;;
+            --rewrite=*) rewrite="${1#*=}"; shift ;;
+            --rewrite) rewrite="$2"; shift 2 ;;
+            -*) err "未知选项: $1"; exit 1 ;;
+            *)
+                if [[ -z "$domain" ]]; then domain="$1"
+                else phpv="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    [[ -z "$domain" ]] && { err "用法: lnmp site:add <domain> [php_ver] [--env-db] [--rewrite=<name>]"; exit 1; }
+
+    # rewrite 校验
+    if [[ -n "$rewrite" ]] && [[ ! -f "nginx-gateway/conf/rewrite/${rewrite}.conf" ]]; then
+        err "未知 rewrite: $rewrite"
+        err "可用: $(ls nginx-gateway/conf/rewrite/ 2>/dev/null | sed 's/\.conf$//' | xargs)"
+        exit 1
+    fi
+
+    # 版本校验: 仅接受主版本 (X.Y), 不接受子版本 (X.Y.Z)
+    case "$phpv" in
+        5.6|7.0|7.1|7.2|7.3|7.4|8.0|8.1|8.2|8.3|8.4|8.5) ;;
+        *) err "不支持 PHP 版本: $phpv (可用: 5.6 | 7.0-7.4 | 8.0-8.5)"; exit 1 ;;
+    esac
+
+    # 按主版本选 Dockerfile 和 conf 目录
+    local php_dockerfile="Dockerfile.alpine"
+    local php_conf_dir
+    case "$phpv" in
+        5.6)            php_dockerfile="Dockerfile.legacy"; php_conf_dir="56" ;;
+        7.0|7.1)        php_dockerfile="Dockerfile.legacy"; php_conf_dir="7x" ;;
+        7.2|7.3|7.4)    php_conf_dir="7x" ;;
+        8.*)            php_conf_dir="8x" ;;
+    esac
+    # 容器名/网络别名不能含 . , 把域名转为安全 key
+    local key
+    key=$(echo "$domain" | tr '.-' '__')
+    local sdir="sites/$key"
+
+    # 站点已存在的两种情况
+    if [[ -d "$sdir" ]]; then
+        if [[ -f "$sdir/docker-compose.yml" ]]; then
+            err "站点已存在: $sdir"
+            err "完全重建: lnmp site:rm $domain --purge && lnmp site:add $domain $phpv"
+            exit 1
+        fi
+        # 只有空目录或 logs, 不算复用
+        if [[ -d "$sdir/www" ]] && [[ -n "$(ls -A "$sdir/www" 2>/dev/null)" ]]; then
+            say "检测到 $sdir/www 有数据, 复用 (不覆盖 index.php)"
+            local _reuse_www=1
+        fi
+    fi
+
+    say "创建站点 $domain (PHP $phpv)"
+    mkdir -p "$sdir/www" "$sdir/logs"
+    cp sites/_template/docker-compose.yml "$sdir/docker-compose.yml"
+    [[ ${_reuse_www:-0} -eq 1 ]] || cp sites/_template/www/index.php "$sdir/www/index.php"
+
+    # 失败回滚: 删半成品配置, 保留 www (避免误删用户数据)
+    local _site_rollback_done=0
+    _site_rollback() {
+        [[ $_site_rollback_done -eq 1 ]] && return
+        _site_rollback_done=1
+        warn "site:add 失败, 回滚配置 (保留 www)"
+        rm -f "$sdir/docker-compose.yml" "$sdir/.env"
+        rm -f "nginx-gateway/conf/sites/${domain}.conf"
+        # 全新站点 (无 www 数据) 才删整个目录
+        if [[ ${_reuse_www:-0} -ne 1 ]] && [[ ! -s "$sdir/www/index.php" || "$(ls "$sdir/www" 2>/dev/null | wc -l)" -le 1 ]]; then
+            rm -rf "$sdir"
+        fi
+    }
+    trap _site_rollback ERR
+
+    # ---------- 询问是否建数据库 ----------
+    local default_db
+    default_db=$(echo "$domain" | tr '.-' '__')
+    local db_name="" db_user="" db_pass="" db_host="mysql"
+    local create_db="n" mysql_ver="8"
+
+    if [[ -t 0 ]]; then
+        printf "${C_Y}[?]${C_N} 顺便创建 MySQL 库和用户? [Y/n] "
+        local ans; read -r ans
+        ans=${ans:-Y}
+        [[ "$ans" =~ ^[Yy]$ ]] && create_db="y"
+    fi
+
+    if [[ "$create_db" == "y" ]]; then
+        # 选实例
+        local has8=0 has57=0
+        docker ps --format '{{.Names}}' | grep -q '^pp_lnmp_mysql$'   && has8=1
+        docker ps --format '{{.Names}}' | grep -q '^pp_lnmp_mysql57$' && has57=1
+
+        if [[ $has8 -eq 0 && $has57 -eq 0 ]]; then
+            warn "没有运行中的 MySQL 实例,跳过建库 (启动后用 lnmp db:create)"
+            create_db="n"
+        elif [[ $has8 -eq 1 && $has57 -eq 1 ]]; then
+            printf "${C_Y}[?]${C_N} 使用哪个 MySQL? [8/57] (默认 8): "
+            local mv; read -r mv
+            case "${mv:-8}" in 57|5|5.7) mysql_ver="57"; db_host="mysql57" ;; *) mysql_ver="8"; db_host="mysql" ;; esac
+        elif [[ $has57 -eq 1 ]]; then
+            mysql_ver="57"; db_host="mysql57"
+            say "(只有 MySQL 5.7 在运行, 使用之)"
+        fi
+    fi
+
+    if [[ "$create_db" == "y" ]]; then
+        printf "${C_Y}[?]${C_N} 库名 [%s]: " "$default_db";   read -r db_name; db_name=${db_name:-$default_db}
+        printf "${C_Y}[?]${C_N} 用户 [%s]: " "$db_name";       read -r db_user; db_user=${db_user:-$db_name}
+        local rand_pass
+        rand_pass=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20 || echo "Pass$(date +%s)")
+        printf "${C_Y}[?]${C_N} 密码 [随机:%s]: " "$rand_pass"; read -r db_pass; db_pass=${db_pass:-$rand_pass}
+
+        cmd_db_create -m "$mysql_ver" "$db_name" "$db_user" "$db_pass"
+    fi
+
+    # 写本站点 .env (含 DB 凭据, PHP 容器可直接读)
+    {
+        echo "COMPOSE_PROJECT_NAME=pp_lnmp_site_$key"
+        echo "SITE_KEY=$key"
+        echo "SITE_DOMAIN=$domain"
+        echo "PHP_VERSION=$phpv"
+        echo "PHP_DOCKERFILE=$php_dockerfile"
+        echo "PHP_CONF_DIR=$php_conf_dir"
+        echo "LNMP_NETWORK=${LNMP_NETWORK}"
+        echo "TZ=${TZ}"
+        # 业务依赖标记 (CLI 用, 决定启动哪些可选栈; PHP 不读)
+        if [[ "$create_db" == "y" ]]; then
+            echo "LNMP_USE_MYSQL=$db_host"
+        fi
+        # 默认不写 DB_*; 加 --env-db (Laravel/Symfony/TP 等读 getenv() 的框架) 才写
+        if [[ "$create_db" == "y" && $env_db -eq 1 ]]; then
+            echo ""
+            echo "# ---- 数据库 (容器内连接, PHP 可 getenv() 读) ----"
+            echo "DB_HOST=$db_host"
+            echo "DB_PORT=3306"
+            echo "DB_NAME=$db_name"
+            echo "DB_USER=$db_user"
+            echo "DB_PASSWORD=$db_pass"
+        fi
+    } > "$sdir/.env"
+    chmod 600 "$sdir/.env" 2>/dev/null || true
+
+    # 生成 nginx 站点配置
+    local conf="nginx-gateway/conf/sites/${domain}.conf"
+    local rewrite_line=""
+    [[ -n "$rewrite" ]] && rewrite_line="include /etc/nginx/rewrite/${rewrite}.conf;"
+
+    # 证书路径 fallback: 如果该站证书不存在, 用 default 占位证书 (避免 nginx 全站暴毙)
+    local cert_crt="/etc/nginx/ssl/live/${domain}/fullchain.cer"
+    local cert_key="/etc/nginx/ssl/live/${domain}/${domain}.key"
+    if [[ ! -f "ssl/live/${domain}/fullchain.cer" ]]; then
+        warn "$domain 无有效证书, 暂用 default 占位 (稍后签发: lnmp cert:issue $domain)"
+        cert_crt="/etc/nginx/ssl/default/fullchain.cer"
+        cert_key="/etc/nginx/ssl/default/default.key"
+    fi
+
+    sed -e "s|DOMAIN|${domain}|g" -e "s|SITE_KEY|${key}|g" \
+        -e "s|REWRITE_INCLUDE|${rewrite_line}|" \
+        -e "s|ssl_certificate .*|ssl_certificate ${cert_crt};|" \
+        -e "s|ssl_certificate_key .*|ssl_certificate_key ${cert_key};|" \
+        nginx-gateway/conf/sites/_template.conf.example > "$conf"
+    [[ -n "$rewrite" ]] && say "已套用 rewrite: $rewrite"
+
+    # 站点启动 (与根 .env 合并)
+    say "构建并启动 php-fpm"
+    (cd "$sdir" && $DC -p "pp_lnmp_site_$key" --env-file ./.env --env-file "$ROOT_DIR/.env" up -d --build)
+
+    # 自签占位证书 (避免 nginx 启动失败)
+    _gen_selfsigned "$domain"
+
+    # 自签后更新 nginx 配置指向刚生成的占位证书 (不再用 default)
+    local conf="nginx-gateway/conf/sites/${domain}.conf"
+    if [[ -f "$conf" ]] && [[ -f "ssl/live/${domain}/fullchain.cer" ]]; then
+        sed -i \
+            -e "s|ssl_certificate /etc/nginx/ssl/default/fullchain.cer;|ssl_certificate /etc/nginx/ssl/live/${domain}/fullchain.cer;|" \
+            -e "s|ssl_certificate_key /etc/nginx/ssl/default/default.key;|ssl_certificate_key /etc/nginx/ssl/live/${domain}/${domain}.key;|" \
+            "$conf"
+    fi
+
+    # reload nginx
+    cmd_site_reload || true
+    ok "站点 $domain 已建"
+    if [[ "$create_db" == "y" ]]; then
+        echo
+        echo "  ====== 数据库凭据 (请妥善保存) ======"
+        echo "  主机: ${db_host}       (容器内连接, PHP/Discuz/WP 配置都填这个)"
+        echo "  端口: 3306"
+        echo "  库名: ${db_name}"
+        echo "  用户: ${db_user}"
+        echo "  密码: ${db_pass}"
+        echo "  ====================================="
+        if [[ $env_db -eq 1 ]]; then
+            echo "  (DB_* 已写入 sites/${key}/.env, PHP 用 getenv() 读)"
+        else
+            echo "  (未写入 .env, 装程序时手动填; 要让 PHP getenv() 读: site:add ... --env-db)"
+        fi
+    fi
+    echo
+    ok "下一步: lnmp cert:issue $domain"
+    trap - ERR
+}
+
+_gen_selfsigned() {
+    local d="$1"
+    local out="ssl/live/$d"
+    [[ -f "$out/fullchain.cer" ]] && return 0
+    mkdir -p "$out"
+    say "生成自签占位证书 $d"
+    if docker ps --format '{{.Names}}' | grep -q '^pp_lnmp_acme$'; then
+        # acme 容器把 ../ssl 挂在 /ssl (rw), 自带 openssl
+        docker exec pp_lnmp_acme sh -c "openssl req -x509 -nodes -newkey rsa:2048 -days 30 \
+            -keyout /ssl/live/${d}/${d}.key \
+            -out    /ssl/live/${d}/fullchain.cer \
+            -subj '/CN=${d}' 2>/dev/null" \
+        && ok "证书已生成" \
+        || warn "自签失败"
+    else
+        warn "pp_lnmp_acme 容器未运行,跳过自签 (lnmp up nginx 后重试)"
+    fi
+}
+
+cmd_site_rm() {
+    local domain="" purge=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --purge|-p) purge=1; shift ;;
+            *) domain="$1"; shift ;;
+        esac
+    done
+    [[ -z "$domain" ]] && { err "用法: lnmp site:rm <domain> [--purge]"; exit 1; }
+    [[ "$domain" == "_template" ]] && { err "拒绝删除 _template"; exit 1; }
+    local key
+    key=$(echo "$domain" | tr '.-' '__')
+    local sdir="sites/$key"
+
+    # 先删 nginx 配置 (即使站点目录已手动删了也要清理)
+    if [[ -f "nginx-gateway/conf/sites/${domain}.conf" ]]; then
+        rm -f "nginx-gateway/conf/sites/${domain}.conf"
+        say "已删除 nginx 配置: $domain.conf"
+    fi
+
+    # 停止/删除 PHP 容器
+    if [[ -d "$sdir" ]]; then
+        (cd "$sdir" && $DC -p "pp_lnmp_site_$key" --env-file ./.env --env-file "$ROOT_DIR/.env" down) 2>/dev/null || true
+    fi
+    docker rm -f "lnmp_site_${key}_php" "pp_lnmp_site_${key}_php" 2>/dev/null || true
+
+    if [[ $purge -eq 1 ]]; then
+        rm -rf "$sdir"
+        rm -rf "ssl/live/$domain"
+        ok "已彻底删除 sites/$key 和 ssl/live/$domain"
+    else
+        # 只删 compose/.env, 保留 www 和 logs
+        rm -f "$sdir/docker-compose.yml" "$sdir/.env" 2>/dev/null || true
+        warn "已删除 nginx vhost + 容器, 保留 sites/$key/www 数据"
+        warn "完全清除: lnmp site:rm $domain --purge"
+    fi
+    cmd_site_reload || true
+}
+
+cmd_site_list() {
+    printf "%-30s %-8s %s\n" "DOMAIN" "PHP" "STATUS"
+    for d in sites/*/; do
+        local name=$(basename "$d")
+        [[ "$name" == "_template" ]] && continue
+        local php=$(grep -E '^PHP_VERSION=' "$d/.env" 2>/dev/null | cut -d= -f2)
+        local status="stopped"
+        docker ps --format '{{.Names}}' | grep -q "pp_lnmp_site_${name}_php" && status="running"
+        printf "%-30s %-8s %s\n" "$name" "${php:-?}" "$status"
+    done
+}
+
+cmd_site_reload() {
+    docker exec pp_lnmp_nginx nginx -t && docker exec pp_lnmp_nginx nginx -s reload && ok "nginx reloaded"
+}
+
+cmd_site_restart() {
+    local domain="${1:-}" rebuild=0
+    [[ "$domain" == "--build" || "$domain" == "-b" ]] && { rebuild=1; domain="${2:-}"; }
+    [[ -z "$domain" ]] && { err "用法: lnmp site:restart <domain> [--build]"; exit 1; }
+    local key; key=$(echo "$domain" | tr '.-' '__')
+    local sdir="sites/$key"
+    [[ -d "$sdir" ]] || { err "站点不存在: $sdir"; exit 1; }
+
+    if [[ $rebuild -eq 1 ]]; then
+        say "重 build + 重启站点 $domain (Dockerfile 改动生效)"
+        (cd "$sdir" && $DC -p "pp_lnmp_site_$key" --env-file ./.env --env-file "$ROOT_DIR/.env" up -d --build)
+    else
+        say "重启站点 $domain"
+        docker restart "pp_lnmp_site_${key}_php" >/dev/null
+    fi
+    docker exec pp_lnmp_nginx nginx -s reload 2>/dev/null || true
+    ok "已重启 $domain"
+}
+
+cmd_site_logs() {
+    local domain="${1:-}"; shift || true
+    [[ -z "$domain" ]] && { err "用法: lnmp site:logs <domain> [-f]"; exit 1; }
+    local key; key=$(echo "$domain" | tr '.-' '__')
+    docker logs "pp_lnmp_site_${key}_php" "$@"
+}
+
+cmd_site_rewrites() {
+    echo "可用 rewrite 规则 (site:add --rewrite=<name>):"
+    echo
+    for f in nginx-gateway/conf/rewrite/*.conf; do
+        [[ -f "$f" ]] || continue
+        local name; name=$(basename "$f" .conf)
+        printf "  %-15s  %s\n" "$name" "nginx-gateway/conf/rewrite/${name}.conf"
+    done
+    echo
+    echo "示例: lnmp site:add bbs.com 7.4 --rewrite=discuzx"
+}
+
+# ----- 证书 -----
+_acme() { MSYS2_ARG_CONV_EXCL="*" docker exec -i pp_lnmp_acme "$@"; }
+
+cmd_cert_issue() {
+    local domain="${1:-}"
+    [[ -z "$domain" ]] && { err "用法: lnmp cert:issue <domain>"; exit 1; }
+    docker ps --format '{{.Names}}' | grep -q pp_lnmp_acme || { err "请先 lnmp up nginx"; exit 1; }
+
+    # 智能 SAN: 根域同时签 www; 已是 www 或子域不再加
+    local extra_d=""
+    if [[ "$domain" =~ ^[^.]+\.[^.]+$ ]]; then
+        extra_d="-d www.$domain"
+    fi
+
+    _acme --register-account -m "${ACME_EMAIL}" --server letsencrypt || true
+
+    # acme.sh --issue 返回值: 0=新签发成功, 2=证书未到期跳过
+    # 用 set +e 暂闭 errexit, 避免 rc=2 直接终止脚本
+    local issue_rc=0
+    set +e
+    if [[ -n "${ACME_DNS_API:-}" ]]; then
+        say "DNS 模式 ($ACME_DNS_API) 签发 $domain ${extra_d:+(+ www)}"
+        _acme --issue --dns "$ACME_DNS_API" -d "$domain" $extra_d --server letsencrypt
+    else
+        say "webroot(http-01) 模式签发 $domain ${extra_d:+(+ www)}"
+        mkdir -p acme/data/.well-known/acme-challenge
+        _acme --issue -d "$domain" $extra_d \
+            -w /acme.sh/.well-known --server letsencrypt
+    fi
+    issue_rc=$?
+    set -e
+
+    if [[ $issue_rc -eq 2 ]]; then
+        say "证书未到期, 跳过签发 (仍会安装已签发的证书)"
+    elif [[ $issue_rc -ne 0 ]]; then
+        err "acme.sh --issue 失败 (exit=$issue_rc)"
+        exit 1
+    fi
+
+    # 签发(或已有)后, 安装证书到 nginx 可读路径
+    MSYS2_ARG_CONV_EXCL="*" docker exec pp_lnmp_acme mkdir -p "/ssl/live/$domain" 2>/dev/null || true
+    _acme --install-cert -d "$domain" --ecc \
+        --key-file       "/ssl/live/$domain/$domain.key" \
+        --fullchain-file "/ssl/live/$domain/fullchain.cer" \
+        --reloadcmd      "echo reload-handled-by-host"
+
+    # 验证: 确认安装的是 Let's Encrypt 证书而非自签占位证书
+    local issuer
+    issuer=$(MSYS2_ARG_CONV_EXCL="*" docker exec pp_lnmp_acme openssl x509 -in "/ssl/live/$domain/fullchain.cer" -noout -issuer 2>/dev/null || true)
+    if [[ "$issuer" != *"Let's Encrypt"* ]]; then
+        err "证书安装异常 (issuer=$issuer), 非 Let's Encrypt 签发!"
+        err "可能是 acme.sh --install-cert 未覆盖自签占位证书"
+        exit 1
+    fi
+    ok "证书已验证: $issuer"
+
+    # 签发后更新 nginx 配置, 把 default 占位证书路径换成真证书
+    local conf="nginx-gateway/conf/sites/${domain}.conf"
+    if [[ -f "$conf" ]]; then
+        sed -i \
+            -e "s|ssl_certificate /etc/nginx/ssl/default/fullchain.cer;|ssl_certificate /etc/nginx/ssl/live/${domain}/fullchain.cer;|" \
+            -e "s|ssl_certificate_key /etc/nginx/ssl/default/default.key;|ssl_certificate_key /etc/nginx/ssl/live/${domain}/${domain}.key;|" \
+            "$conf"
+        say "nginx 配置已更新: $conf"
+    fi
+
+    cmd_site_reload || true
+    ok "证书签发并安装完成"
+}
+
+cmd_cert_renew() {
+    local domain="${1:-}"
+    set +e
+    if [[ -z "$domain" ]]; then
+        _acme --cron
+    else
+        _acme --renew -d "$domain" --force
+    fi
+    set -e
+    cmd_site_reload || true
+}
+
+cmd_cert_list() { _acme --list; }
+
+# ----- DB -----
+# 解析 -m / --mysql 参数, 设置全局: DB_CONTAINER / DB_ROOTPASS / DB_LABEL / DB_COLLATE
+# 用法: _db_target "$@"  会消耗 -m <8|57|5.7> 并返回剩余参数到全局 DB_ARGS
+_db_target() {
+    local target="8" rest=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -m|--mysql) target="$2"; shift 2 ;;
+            -m=*|--mysql=*) target="${1#*=}"; shift ;;
+            *) rest+=("$1"); shift ;;
+        esac
+    done
+    case "$target" in
+        8|84|8.4|main) DB_CONTAINER=pp_lnmp_mysql;   DB_ROOTPASS="${MYSQL_ROOT_PASSWORD}"; DB_LABEL="MySQL 8.4"; DB_COLLATE="utf8mb4_0900_ai_ci" ;;
+        5|57|5.7|old) DB_CONTAINER=pp_lnmp_mysql57; DB_ROOTPASS="${MYSQL57_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD}}"; DB_LABEL="MySQL 5.7"; DB_COLLATE="utf8mb4_unicode_ci" ;;
+        *) err "未知 mysql 实例: $target (用 8 或 57)"; exit 1 ;;
+    esac
+    DB_ARGS=("${rest[@]}")
+}
+
+cmd_db_cli() {
+    _db_target "$@"
+    docker exec -it -e MYSQL_PWD="${DB_ROOTPASS}" "$DB_CONTAINER" mysql -uroot
+}
+cmd_db_dump() {
+    _db_target "$@"
+    local db="${DB_ARGS[0]:-}"
+    [[ -z "$db" ]] && { err "用法: lnmp db:dump [-m 57|8] <database>"; exit 1; }
+    local out="backups/${db}-$(date +%Y%m%d-%H%M%S).sql.gz"
+    say "[$DB_LABEL] 导出 $db -> $out"
+    docker exec -e MYSQL_PWD="${DB_ROOTPASS}" "$DB_CONTAINER" sh -c "mysqldump --single-transaction --routines --triggers -uroot ${db}" | gzip > "$out"
+    ok "完成 $(ls -lh $out | awk '{print $5}')"
+}
+cmd_db_dumpall() {
+    _db_target "$@"
+    local out="backups/all-${DB_CONTAINER#lnmp_}-$(date +%Y%m%d-%H%M%S).sql.gz"
+    say "[$DB_LABEL] 导出全部库 -> $out"
+    docker exec -e MYSQL_PWD="${DB_ROOTPASS}" "$DB_CONTAINER" sh -c "mysqldump --single-transaction --routines --triggers --all-databases -uroot" | gzip > "$out"
+    ok "完成 $(ls -lh $out | awk '{print $5}')"
+}
+cmd_db_import() {
+    _db_target "$@"
+    local file="${DB_ARGS[0]:-}"
+    [[ -f "$file" ]] || { err "用法: lnmp db:import [-m 57|8] <file>  (文件不存在: $file)"; exit 1; }
+    say "[$DB_LABEL] 导入 $file"
+    if [[ "$file" == *.gz ]]; then
+        gunzip -c "$file" | docker exec -i -e MYSQL_PWD="${DB_ROOTPASS}" "$DB_CONTAINER" mysql -uroot
+    else
+        docker exec -i -e MYSQL_PWD="${DB_ROOTPASS}" "$DB_CONTAINER" mysql -uroot < "$file"
+    fi
+    ok "导入完成"
+}
+cmd_db_create() {
+    _db_target "$@"
+    local db="${DB_ARGS[0]:-}" user="${DB_ARGS[1]:-}" pass="${DB_ARGS[2]:-}"
+    [[ -z "$db" ]] && { err "用法: lnmp db:create [-m 57|8] <db> [user] [pass]"; exit 1; }
+    docker ps --format '{{.Names}}' | grep -q "^${DB_CONTAINER}$" || { err "$DB_LABEL 未运行 ($DB_CONTAINER)"; exit 1; }
+    # 先验 root 密码 (避免给出 mysql 原始错误)
+    if ! docker exec -i -e MYSQL_PWD="${DB_ROOTPASS}" "$DB_CONTAINER" mysql -uroot -e "SELECT 1" >/dev/null 2>&1; then
+        err "无法连接 $DB_LABEL: root 密码与 .env 不一致"
+        err "原因: 数据卷里的 root 密码是首次初始化时设的, 后改 .env 不会同步"
+        err "修复: lnmp down $([[ \"$DB_CONTAINER\" == pp_lnmp_mysql57 ]] && echo mysql57 || echo mysql) && docker volume rm ${DB_CONTAINER//lnmp_/lnmp_}_data && lnmp up $([[ \"$DB_CONTAINER\" == pp_lnmp_mysql57 ]] && echo mysql57 || echo mysql)"
+        err "(如有业务数据, 先备份: lnmp db:dumpall)"
+        exit 1
+    fi
+    local sql="CREATE DATABASE IF NOT EXISTS \`$db\` DEFAULT CHARACTER SET utf8mb4 COLLATE ${DB_COLLATE};"
+    if [[ -n "$user" && -n "$pass" ]]; then
+        sql+=" CREATE USER IF NOT EXISTS '$user'@'%' IDENTIFIED BY '$pass'; GRANT ALL PRIVILEGES ON \`$db\`.* TO '$user'@'%'; FLUSH PRIVILEGES;"
+    fi
+    docker exec -i -e MYSQL_PWD="${DB_ROOTPASS}" "$DB_CONTAINER" mysql -uroot -e "$sql"
+    ok "[$DB_LABEL] DB $db 已就绪"
+}
+
+# 改写 .env 中 KEY=VALUE (不存在则追加)。VALUE 原样写入,不加引号。
+_env_set() {
+    local key="$1" val="$2" file="$ROOT_DIR/.env"
+    [[ -f "$file" ]] || { err ".env 不存在"; return 1; }
+    cp "$file" "$file.bak.$(date +%s)"
+    local esc_val
+    esc_val=$(printf '%s\n' "$val" | sed -e 's/[\/&|]/\\&/g')
+    if grep -qE "^${key}=" "$file"; then
+        sed -i.tmp "s|^${key}=.*|${key}=${esc_val}|" "$file" && rm -f "$file.tmp"
+    else
+        printf '\n%s=%s\n' "$key" "$val" >> "$file"
+    fi
+}
+
+cmd_db_passwd() {
+    _db_target "$@"
+    local user="${DB_ARGS[0]:-}" newpass="${DB_ARGS[1]:-}"
+    [[ -z "$user" || -z "$newpass" ]] && { err "用法: lnmp db:passwd [-m 57|8] <user> <newpass>"; exit 1; }
+
+    docker ps --format '{{.Names}}' | grep -q "^${DB_CONTAINER}$" || { err "$DB_LABEL 未运行"; exit 1; }
+
+    local sql
+    if [[ "$user" == "root" ]]; then
+        sql="ALTER USER 'root'@'%' IDENTIFIED BY '${newpass}'; ALTER USER 'root'@'localhost' IDENTIFIED BY '${newpass}'; FLUSH PRIVILEGES;"
+    else
+        sql="ALTER USER '${user}'@'%' IDENTIFIED BY '${newpass}'; FLUSH PRIVILEGES;"
+    fi
+
+    say "[$DB_LABEL] 修改用户 ${user} 的密码"
+    if ! docker exec -i -e MYSQL_PWD="${DB_ROOTPASS}" "$DB_CONTAINER" mysql -uroot -e "$sql"; then
+        err "执行失败 (root 密码可能与 .env 不一致?)"
+        exit 1
+    fi
+
+    if [[ "$user" == "root" ]]; then
+        if [[ "$DB_CONTAINER" == "pp_lnmp_mysql" ]]; then
+            _env_set MYSQL_ROOT_PASSWORD "$newpass"
+            ok "已更新 + 同步 .env: MYSQL_ROOT_PASSWORD"
+        else
+            _env_set MYSQL57_ROOT_PASSWORD "$newpass"
+            ok "已更新 + 同步 .env: MYSQL57_ROOT_PASSWORD"
+        fi
+    else
+        ok "已更新用户 ${user} 密码"
+        warn "记得改对应 sites/<域>/.env 中 DB_PASSWORD"
+    fi
+}
+
+cmd_db_users() {
+    _db_target "$@"
+    docker exec -i -e MYSQL_PWD="${DB_ROOTPASS}" "$DB_CONTAINER" mysql -uroot -e \
+        "SELECT user, host, plugin FROM mysql.user ORDER BY user;"
+}
+
+# ----- Redis -----
+cmd_redis_cli() {
+    docker exec -it pp_lnmp_redis redis-cli -a "${REDIS_PASSWORD}"
+}
+
+cmd_redis_passwd() {
+    local newpass="${1:-}"
+    [[ -z "$newpass" ]] && { err "用法: lnmp redis:passwd <newpass>"; exit 1; }
+    docker ps --format '{{.Names}}' | grep -q '^pp_lnmp_redis$' || { err "Redis 未运行"; exit 1; }
+
+    say "运行时设置新密码"
+    if ! docker exec -i pp_lnmp_redis redis-cli -a "${REDIS_PASSWORD}" CONFIG SET requirepass "$newpass" >/dev/null; then
+        err "CONFIG SET 失败"; exit 1
+    fi
+    # 持久化到 redis.conf (CONFIG REWRITE 只对显式加载的 conf 生效, 我们的 redis 用 conf 文件启动)
+    docker exec -i pp_lnmp_redis redis-cli -a "$newpass" CONFIG REWRITE >/dev/null 2>&1 || \
+        warn "CONFIG REWRITE 失败,重启容器后将以 .env 中的密码为准"
+
+    _env_set REDIS_PASSWORD "$newpass"
+    ok "Redis 密码已更新 + 同步 .env: REDIS_PASSWORD"
+    warn "重启 redis 后会用 .env 中的新密码 (命令行 --requirepass 覆盖)"
+    warn "提示: 站点 PHP 代码中若用了旧密码,请一并更新。"
+}
+
+# ----- PHP -----
+cmd_php_cli() {
+    local domain="${1:-}"; shift || true
+    [[ -z "$domain" ]] && { err "用法: lnmp php:cli <domain> [cmd...]"; exit 1; }
+    local key; key=$(echo "$domain" | tr '.-' '__')
+    local ct="pp_lnmp_site_${key}_php"
+    if [[ $# -eq 0 ]]; then
+        docker exec -it "$ct" sh
+    else
+        docker exec -it "$ct" "$@"
+    fi
+}
+cmd_php_composer() {
+    local domain="${1:-}"; shift || true
+    [[ -z "$domain" ]] && { err "用法: lnmp php:composer <domain> [args...]"; exit 1; }
+    local key; key=$(echo "$domain" | tr '.-' '__')
+    docker exec -it "pp_lnmp_site_${key}_php" composer "$@"
+}
+
+# ----- 工具 -----
+cmd_shell() { docker exec -it "$1" sh; }
+cmd_exec()  { local c="$1"; shift; docker exec -it "$c" "$@"; }
+cmd_pull()  {
+    for s in nginx-gateway mysql adminer redis; do
+        [[ -f "$s/docker-compose.yml" ]] && $DC $(stack_compose "$s") pull || true
+    done
+}
+cmd_prune() { docker system prune -f; docker image prune -f; }
+
+# ============================================================
+# 调度
+# ============================================================
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+    help|-h|--help) cmd_help ;;
+    init)           cmd_init ;;
+    up)             cmd_up "$@" ;;
+    down)           cmd_down "$@" ;;
+    restart)        cmd_restart "$@" ;;
+    ps)             cmd_ps ;;
+    logs)           cmd_logs "$@" ;;
+
+    site:add)       cmd_site_add "$@" ;;
+    site:rm)        cmd_site_rm "$@" ;;
+    site:list)      cmd_site_list ;;
+    site:up)        cmd_site_up "$@" ;;
+    site:down)      cmd_site_down "$@" ;;
+    site:reload)    cmd_site_reload ;;
+    site:restart)   cmd_site_restart "$@" ;;
+    site:logs)      cmd_site_logs "$@" ;;
+    site:rewrites)  cmd_site_rewrites ;;
+
+    cert:issue)     cmd_cert_issue "$@" ;;
+    cert:renew)     cmd_cert_renew "$@" ;;
+    cert:list)      cmd_cert_list ;;
+
+    db:cli)         cmd_db_cli ;;
+    db:dump)        cmd_db_dump "$@" ;;
+    db:dumpall)     cmd_db_dumpall ;;
+    db:import)      cmd_db_import "$@" ;;
+    db:create)      cmd_db_create "$@" ;;
+    db:passwd)      cmd_db_passwd "$@" ;;
+    db:users)       cmd_db_users ;;
+
+    redis:cli)      cmd_redis_cli ;;
+    redis:passwd)   cmd_redis_passwd "$@" ;;
+
+    php:cli)        cmd_php_cli "$@" ;;
+    php:composer)   cmd_php_composer "$@" ;;
+
+    shell)          cmd_shell "$@" ;;
+    exec)           cmd_exec "$@" ;;
+    pull)           cmd_pull ;;
+    prune)          cmd_prune ;;
+    *) err "未知命令: $cmd"; cmd_help; exit 1 ;;
+esac

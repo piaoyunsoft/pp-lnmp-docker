@@ -1,0 +1,64 @@
+# LNMP Docker - MySQL 5.7 (legacy) | by PiaoYun <piaoyunsoft@163.com> | https://www.chinapyg.com
+services:
+  mysql57:
+    image: mysql:${MYSQL57_VERSION:-5.7}
+    container_name: pp_lnmp_mysql57
+    restart: unless-stopped
+    env_file: ../.env
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL57_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD}}
+      TZ: ${TZ:-Asia/Shanghai}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=${MYSQL57_INNODB_BUFFER_POOL_SIZE:-256M}
+      - --innodb-log-file-size=128M
+      - --innodb-flush-log-at-trx-commit=2
+      - --innodb-flush-method=O_DIRECT
+      - --max-connections=${MYSQL57_MAX_CONNECTIONS:-300}
+      - --table-open-cache=2048
+      - --thread-cache-size=32
+      - --tmp-table-size=64M
+      - --max-heap-table-size=64M
+      - --slow-query-log=1
+      - --slow-query-log-file=/var/log/mysql/slow.log
+      - --long-query-time=2
+      - --sql_mode=NO_ENGINE_SUBSTITUTION
+    ports:
+      - "${BIND_HOST_ADMIN:-127.0.0.1}:${MYSQL57_PORT:-3307}:3306"
+    volumes:
+      - ./data:/var/lib/mysql
+      - ./conf:/etc/mysql/conf.d:ro
+      - ./init:/docker-entrypoint-initdb.d:ro
+      - ./logs:/var/log/mysql
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILE:-3}"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL57_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD}}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    networks:
+      pp_lnmp_net:
+        aliases:
+          - mysql57
+          - mysql5
+
+networks:
+  pp_lnmp_net:
+    external: true
+    name: ${LNMP_NETWORK:-pp_lnmp_net}

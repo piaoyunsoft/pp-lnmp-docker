@@ -1,0 +1,42 @@
+# LNMP Docker - Redis 7.4 | by PiaoYun <piaoyunsoft@163.com> | https://www.chinapyg.com
+services:
+  redis:
+    image: redis:${REDIS_VERSION:-7.4-alpine}
+    container_name: pp_lnmp_redis
+    restart: unless-stopped
+    env_file: ../.env
+    command:
+      - redis-server
+      - /usr/local/etc/redis/redis.conf
+      - --requirepass
+      - ${REDIS_PASSWORD}
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "${BIND_HOST_ADMIN:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - ./data:/data
+      - ./conf/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILE:-3}"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - pp_lnmp_net
+
+networks:
+  pp_lnmp_net:
+    external: true
+    name: ${LNMP_NETWORK:-pp_lnmp_net}
+
+volumes:
+  redis_data:
+    name: pp_lnmp_redis_data
