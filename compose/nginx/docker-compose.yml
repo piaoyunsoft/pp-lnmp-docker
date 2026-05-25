@@ -1,0 +1,66 @@
+# LNMP Docker - Nginx Gateway + acme.sh | by PiaoYun <piaoyunsoft@163.com> | https://www.chinapyg.com
+services:
+  nginx:
+    image: nginx:${NGINX_VERSION:-1.27-alpine}
+    container_name: pp_lnmp_nginx
+    restart: unless-stopped
+    ports:
+      - "${BIND_HOST:-}${BIND_HOST:+:}${HTTP_PORT:-80}:80"
+      - "${BIND_HOST:-}${BIND_HOST:+:}${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./conf/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./conf/snippets:/etc/nginx/snippets:ro
+      - ./conf/rewrite:/etc/nginx/rewrite:ro
+      - ./conf/sites:/etc/nginx/conf.d:ro
+      - ../../ssl:/etc/nginx/ssl:ro
+      - ../../sites:/var/www:ro
+      - ./logs:/var/log/nginx
+      - ../acme/data:/var/acme:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILE:-3}"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    tmpfs:
+      - /tmp/nginx:size=128M,mode=1777
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    networks:
+      - pp_lnmp_net
+
+  acme:
+    image: neilpang/acme.sh:latest
+    container_name: pp_lnmp_acme
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+      ACME_DNS_API: ${ACME_DNS_API:-}
+      CF_Token: ${CF_Token:-}
+      CF_Account_ID: ${CF_Account_ID:-}
+      CF_Zone_ID: ${CF_Zone_ID:-}
+      Ali_Key: ${Ali_Key:-}
+      Ali_Secret: ${Ali_Secret:-}
+    command: daemon
+    volumes:
+      - ../acme/data:/acme.sh
+      - ../../ssl:/ssl
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILE:-3}"
+    networks:
+      - pp_lnmp_net
+
+networks:
+  pp_lnmp_net:
+    external: true
+    name: ${LNMP_NETWORK:-pp_lnmp_net}

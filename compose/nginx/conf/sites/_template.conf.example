@@ -1,0 +1,58 @@
+# ============================================================
+# LNMP Docker - 站点 Nginx 模板
+#
+# Author:  PiaoYun <piaoyunsoft@163.com>
+# Website: https://www.chinapyg.com
+# License: MIT
+#
+# 复制为 <yourdomain>.conf 并替换 DOMAIN / SITE_KEY
+#   DOMAIN   = 域名,如 a.com
+#   SITE_KEY = 站点目录名,如 a.com (对应 sites/a.com)
+# fastcgi 用变量, nginx 启动不预解析 DNS, 避免 PHP 容器没起时 nginx 全瘫
+# ============================================================
+
+# HTTP -> HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name DOMAIN www.DOMAIN;
+
+    location /.well-known/acme-challenge/ {
+        root /var/acme;
+    }
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# HTTPS
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name DOMAIN www.DOMAIN;
+
+    root /var/www/SITE_KEY/www;
+    index index.php index.html;
+
+    ssl_certificate     /etc/nginx/ssl/live/DOMAIN/fullchain.cer;
+    ssl_certificate_key /etc/nginx/ssl/live/DOMAIN/DOMAIN.key;
+
+    access_log /var/log/nginx/DOMAIN.access.log main;
+    error_log  /var/log/nginx/DOMAIN.error.log warn;
+
+    # 限流
+    limit_req  zone=req_perip  burst=40 nodelay;
+    limit_conn conn_perip 50;
+
+    # 用变量 + Docker DNS 动态解析, 避免 nginx 启动时 PHP 容器没起就 emerg
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    set $php_upstream SITE_KEY_php:9000;
+
+    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+        REWRITE_INCLUDE
+    }
+
+    include /etc/nginx/snippets/php-fpm.conf;
+}

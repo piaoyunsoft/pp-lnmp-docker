@@ -1,0 +1,46 @@
+# ---------- 敏感配置 ----------
+.env
+.env.bak.*
+
+# ---------- 数据卷 (bind mount) ----------
+compose/mysql/data/
+compose/mysql/logs/
+compose/mysql/init/*
+!compose/mysql/init/.gitkeep
+
+compose/mysql57/data/
+compose/mysql57/logs/
+compose/mysql57/init/*
+!compose/mysql57/init/.gitkeep
+
+compose/redis/data/
+
+compose/nginx/logs/
+
+# ---------- 证书 / acme 状态 ----------
+compose/acme/data/
+ssl/live/
+ssl/default/
+ssl/dhparam/
+
+# ---------- 备份 ----------
+backups/*
+!backups/.gitkeep
+
+# ---------- 站点 (运行时生成, _template 保留) ----------
+sites/*/
+!sites/_template/
+sites/_template/logs/*
+!sites/_template/logs/.gitkeep
+
+# 站点的 nginx vhost (lnmp site:add 自动生成)
+compose/nginx/conf/sites/*.conf
+
+# ---------- 系统/编辑器 ----------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

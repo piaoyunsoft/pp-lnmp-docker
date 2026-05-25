@@ -1,0 +1,65 @@
+# LNMP Docker - MySQL 8.4 | by PiaoYun <piaoyunsoft@163.com> | https://www.chinapyg.com
+services:
+  mysql:
+    image: mysql:${MYSQL_VERSION:-8.4}
+    container_name: pp_lnmp_mysql
+    restart: unless-stopped
+    env_file: ../../.env
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      TZ: ${TZ:-Asia/Shanghai}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-name-resolve
+      - --innodb-buffer-pool-size=${MYSQL_INNODB_BUFFER_POOL_SIZE:-512M}
+      - --innodb-buffer-pool-instances=${MYSQL_INNODB_BUFFER_POOL_INSTANCES:-1}
+      - --innodb-log-file-size=256M
+      - --innodb-flush-log-at-trx-commit=2
+      - --innodb-flush-method=O_DIRECT
+      - --innodb-io-capacity=2000
+      - --innodb-read-io-threads=8
+      - --innodb-write-io-threads=8
+      - --max-connections=${MYSQL_MAX_CONNECTIONS:-500}
+      - --table-open-cache=4096
+      - --thread-cache-size=64
+      - --tmp-table-size=64M
+      - --max-heap-table-size=64M
+      - --slow-query-log=1
+      - --slow-query-log-file=/var/log/mysql/slow.log
+      - --long-query-time=2
+    ports:
+      - "${BIND_HOST_ADMIN:-127.0.0.1}:${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - ./data:/var/lib/mysql
+      # Windows 卷 my.cnf 权限被 MySQL 嫌 world-writable 忽略 (无害, 走 command 调优);
+      # Linux 服务器上 my.cnf 正常生效
+      - ./conf:/etc/mysql/conf.d:ro
+      - ./init:/docker-entrypoint-initdb.d:ro
+      - ./logs:/var/log/mysql
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILE:-3}"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    networks:
+      - pp_lnmp_net
+
+networks:
+  pp_lnmp_net:
+    external: true
+    name: ${LNMP_NETWORK:-pp_lnmp_net}

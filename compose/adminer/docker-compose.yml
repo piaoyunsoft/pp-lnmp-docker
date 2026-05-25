@@ -1,0 +1,25 @@
+# LNMP Docker - Adminer | by PiaoYun <piaoyunsoft@163.com> | https://www.chinapyg.com
+services:
+  adminer:
+    image: adminer:4-standalone
+    container_name: pp_lnmp_adminer
+    restart: unless-stopped
+    env_file: ../../.env
+    environment:
+      ADMINER_DEFAULT_SERVER: mysql
+      ADMINER_DESIGN: pepa-linha
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "${BIND_HOST_ADMIN:-127.0.0.1}:${ADMINER_PORT:-8080}:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILE:-3}"
+    networks:
+      - pp_lnmp_net
+
+networks:
+  pp_lnmp_net:
+    external: true
+    name: ${LNMP_NETWORK:-pp_lnmp_net}

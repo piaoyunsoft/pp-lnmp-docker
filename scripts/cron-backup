@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# ============================================================
+# cron-backup - 备份所有库 + 清理旧备份
+#
+# Author:  PiaoYun <piaoyunsoft@163.com>
+# Website: https://www.chinapyg.com
+# License: MIT
+#
+# crontab 用法:
+#   0 3 * * *  /opt/lnmp_docker/scripts/cron-backup >> /var/log/lnmp-backup.log 2>&1
+# ============================================================
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+# 保留天数
+KEEP_DAYS="${KEEP_DAYS:-14}"
+
+LNMP="$ROOT_DIR/scripts/lnmp"
+DATE=$(date +%Y%m%d-%H%M%S)
+
+echo "[$(date)] backup start"
+
+# MySQL 8.4
+if docker ps --format '{{.Names}}' | grep -q '^pp_lnmp_mysql$'; then
+    "$LNMP" db:dumpall
+fi
+# MySQL 5.7 (如启)
+if docker ps --format '{{.Names}}' | grep -q '^pp_lnmp_mysql57$'; then
+    "$LNMP" db:dumpall -m 57
+fi
+
+# 清理过期备份
+find "$ROOT_DIR/backups" -type f -name "*.sql.gz" -mtime "+${KEEP_DAYS}" -print -delete || true
+
+echo "[$(date)] backup done"
