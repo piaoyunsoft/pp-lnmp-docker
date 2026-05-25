@@ -197,7 +197,8 @@ lnmp site:rewrites              # 查看完整列表
 - acme.sh 容器以 daemon 模式跑，每天自检
 - **DNS 模式**（推荐，支持通配符 + 不开 80）：`.env` 配 `ACME_DNS_API=dns_cf` + CF Token
 - **webroot 模式**（默认）：域名 A 记录指向本机，80 端口可达
-- `site:add` 时自动生成自签占位证书，避免 nginx 起不来
+- `site:add` 时自动生成自签占位证书 → nginx 配置指向占位证书 → 避免 nginx 起不来
+- `lnmp cert:issue <domain>` 签发正式证书 → 自动更新 nginx 配置 → reload 生效
 
 ## 密码管理
 
@@ -256,7 +257,9 @@ lnmp site:rewrites              # 查看完整列表
 | 问题 | 原因 | 解决 |
 |---|---|---|
 | `connect to mysql via localhost: No such file` | PHP `localhost` 走 socket | 改 host 为 `mysql` (容器名) |
-| 自签证书警告 | 浏览器默认行为 | Chrome 地址栏盲打 `thisisunsafe` |
+| 自签证书警告 | 浏览器默认行为 | 签发正式证书: `lnmp cert:issue <domain>` |
+| 证书已签发但浏览器不绿 | Git Bash 路径转换, 证书装错位置 | 升级到最新脚本 (已修复 `MSYS2_ARG_CONV_EXCL`) |
+| 站点删了但 nginx 配置还在 | `site:rm` 检查目录存在时才删配置 | 手动 `rm nginx-gateway/conf/sites/<域名>.conf`, 然后 `lnmp site:reload` |
 | 502 Bad Gateway | PHP 容器没起 | `docker logs pp_lnmp_site_<key>_php` |
 | MySQL "World-writable config ignored" | Windows 卷权限 | 已用 command 参数绕过, 无影响 |
 | `Container is restarting` | MySQL 配置错 / 数据不完整 | `docker logs pp_lnmp_mysql` 看真实错 |

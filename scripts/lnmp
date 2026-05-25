@@ -8,6 +8,9 @@
 #
 # 用法: ./scripts/lnmp <command> [args...]
 # ============================================================
+# Git Bash/MSYS2 下防止路径自动转换: /ssl/... -> C:/Program Files/Git/ssl/...
+# 影响 docker exec 参数传递, 导致 --install-cert 写错路径
+export MSYS2_ARG_CONV_EXCL="*"
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -564,6 +567,15 @@ cmd_site_add() {
     # 自签占位证书 (避免 nginx 启动失败)
     _gen_selfsigned "$domain"
 
+    # 自签后更新 nginx 配置指向刚生成的占位证书 (不再用 default)
+    local conf="nginx-gateway/conf/sites/${domain}.conf"
+    if [[ -f "$conf" ]] && [[ -f "ssl/live/${domain}/fullchain.cer" ]]; then
+        sed -i \
+            -e "s|ssl_certificate /etc/nginx/ssl/default/fullchain.cer;|ssl_certificate /etc/nginx/ssl/live/${domain}/fullchain.cer;|" \
+            -e "s|ssl_certificate_key /etc/nginx/ssl/default/default.key;|ssl_certificate_key /etc/nginx/ssl/live/${domain}/${domain}.key;|" \
+            "$conf"
+    fi
+
     # reload nginx
     cmd_site_reload || true
     ok "站点 $domain 已建"
@@ -619,12 +631,18 @@ cmd_site_rm() {
     local key
     key=$(echo "$domain" | tr '.-' '__')
     local sdir="sites/$key"
-    [[ -d "$sdir" ]] || { err "站点不存在 ($sdir)"; exit 1; }
 
-    say "停止站点 $domain"
-    (cd "$sdir" && $DC -p "pp_lnmp_site_$key" --env-file ./.env --env-file "$ROOT_DIR/.env" down) 2>/dev/null || true
+    # 先删 nginx 配置 (即使站点目录已手动删了也要清理)
+    if [[ -f "nginx-gateway/conf/sites/${domain}.conf" ]]; then
+        rm -f "nginx-gateway/conf/sites/${domain}.conf"
+        say "已删除 nginx 配置: $domain.conf"
+    fi
+
+    # 停止/删除 PHP 容器
+    if [[ -d "$sdir" ]]; then
+        (cd "$sdir" && $DC -p "pp_lnmp_site_$key" --env-file ./.env --env-file "$ROOT_DIR/.env" down) 2>/dev/null || true
+    fi
     docker rm -f "lnmp_site_${key}_php" "pp_lnmp_site_${key}_php" 2>/dev/null || true
-    rm -f "nginx-gateway/conf/sites/${domain}.conf"
 
     if [[ $purge -eq 1 ]]; then
         rm -rf "$sdir"
@@ -632,7 +650,7 @@ cmd_site_rm() {
         ok "已彻底删除 sites/$key 和 ssl/live/$domain"
     else
         # 只删 compose/.env, 保留 www 和 logs
-        rm -f "$sdir/docker-compose.yml" "$sdir/.env"
+        rm -f "$sdir/docker-compose.yml" "$sdir/.env" 2>/dev/null || true
         warn "已删除 nginx vhost + 容器, 保留 sites/$key/www 数据"
         warn "完全清除: lnmp site:rm $domain --purge"
     fi
@@ -694,7 +712,7 @@ cmd_site_rewrites() {
 }
 
 # ----- 证书 -----
-_acme() { docker exec -i pp_lnmp_acme "$@"; }
+_acme() { MSYS2_ARG_CONV_EXCL="*" docker exec -i pp_lnmp_acme "$@"; }
 
 cmd_cert_issue() {
     local domain="${1:-}"
@@ -709,6 +727,10 @@ cmd_cert_issue() {
 
     _acme --register-account -m "${ACME_EMAIL}" --server letsencrypt || true
 
+    # acme.sh --issue 返回值: 0=新签发成功, 2=证书未到期跳过
+    # 用 set +e 暂闭 errexit, 避免 rc=2 直接终止脚本
+    local issue_rc=0
+    set +e
     if [[ -n "${ACME_DNS_API:-}" ]]; then
         say "DNS 模式 ($ACME_DNS_API) 签发 $domain ${extra_d:+(+ www)}"
         _acme --issue --dns "$ACME_DNS_API" -d "$domain" $extra_d --server letsencrypt
@@ -718,12 +740,42 @@ cmd_cert_issue() {
         _acme --issue -d "$domain" $extra_d \
             -w /acme.sh/.well-known --server letsencrypt
     fi
+    issue_rc=$?
+    set -e
 
+    if [[ $issue_rc -eq 2 ]]; then
+        say "证书未到期, 跳过签发 (仍会安装已签发的证书)"
+    elif [[ $issue_rc -ne 0 ]]; then
+        err "acme.sh --issue 失败 (exit=$issue_rc)"
+        exit 1
+    fi
+
+    # 签发(或已有)后, 安装证书到 nginx 可读路径
     docker exec pp_lnmp_acme mkdir -p "/ssl/live/$domain" 2>/dev/null || true
     _acme --install-cert -d "$domain" --ecc \
         --key-file       "/ssl/live/$domain/$domain.key" \
         --fullchain-file "/ssl/live/$domain/fullchain.cer" \
         --reloadcmd      "echo reload-handled-by-host"
+
+    # 验证: 确认安装的是 Let's Encrypt 证书而非自签占位证书
+    local issuer
+    issuer=$(docker exec pp_lnmp_acme openssl x509 -in "/ssl/live/$domain/fullchain.cer" -noout -issuer 2>/dev/null || true)
+    if [[ "$issuer" != *"Let's Encrypt"* ]]; then
+        err "证书安装异常 (issuer=$issuer), 非 Let's Encrypt 签发!"
+        err "可能是 acme.sh --install-cert 未覆盖自签占位证书"
+        exit 1
+    fi
+    ok "证书已验证: $issuer"
+
+    # 签发后更新 nginx 配置, 把 default 占位证书路径换成真证书
+    local conf="nginx-gateway/conf/sites/${domain}.conf"
+    if [[ -f "$conf" ]]; then
+        sed -i \
+            -e "s|ssl_certificate /etc/nginx/ssl/default/fullchain.cer;|ssl_certificate /etc/nginx/ssl/live/${domain}/fullchain.cer;|" \
+            -e "s|ssl_certificate_key /etc/nginx/ssl/default/default.key;|ssl_certificate_key /etc/nginx/ssl/live/${domain}/${domain}.key;|" \
+            "$conf"
+        say "nginx 配置已更新: $conf"
+    fi
 
     cmd_site_reload || true
     ok "证书签发并安装完成"
@@ -731,11 +783,13 @@ cmd_cert_issue() {
 
 cmd_cert_renew() {
     local domain="${1:-}"
+    set +e
     if [[ -z "$domain" ]]; then
         _acme --cron
     else
         _acme --renew -d "$domain" --force
     fi
+    set -e
     cmd_site_reload || true
 }
 
